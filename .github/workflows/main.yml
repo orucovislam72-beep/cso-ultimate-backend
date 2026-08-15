@@ -1,0 +1,281 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build NextEmu APK
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ==========================================
+      # 1. Скачать репозиторий
+      # ==========================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # ==========================================
+      # 2. Найти и распаковать ZIP
+      # ==========================================
+      - name: Unzip NextEmu project
+        run: |
+          set -e
+
+          echo "=== ZIP files in repository ==="
+
+          find . \
+            -maxdepth 2 \
+            -type f \
+            -iname "*.zip" \
+            -print
+
+          ZIP_FILE=$(find . \
+            -maxdepth 2 \
+            -type f \
+            -iname "*.zip" \
+            | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found!"
+            exit 1
+          fi
+
+          echo ""
+          echo "Using ZIP:"
+          echo "$ZIP_FILE"
+
+          rm -rf project
+          mkdir -p project
+
+          unzip -q "$ZIP_FILE" -d project
+
+          echo ""
+          echo "=== Project root ==="
+          find project -maxdepth 2 -type f | sort | head -100
+
+
+      # ==========================================
+      # 3. JDK 17
+      # ==========================================
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+
+      # ==========================================
+      # 4. Gradle
+      # ==========================================
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+
+      # ==========================================
+      # 5. Проверить структуру проекта
+      # ==========================================
+      - name: Verify Gradle project
+        working-directory: project
+        run: |
+          set -e
+
+          echo "=== Gradle files ==="
+
+          find . -type f \
+            \( -name "build.gradle" \
+            -o -name "build.gradle.kts" \
+            -o -name "settings.gradle" \
+            -o -name "settings.gradle.kts" \
+            -o -name "libs.versions.toml" \) \
+            -print
+
+          echo ""
+          echo "=== Checking app ==="
+
+          if [ ! -d "app" ]; then
+            echo "ERROR: app directory not found!"
+            echo ""
+            echo "Project contents:"
+            find . -maxdepth 3 -type f | sort
+            exit 1
+          fi
+
+          echo "app directory found."
+
+
+      # ==========================================
+      # 6. Настроить AndroidX и Gradle
+      # ==========================================
+      - name: Configure AndroidX
+        working-directory: project
+        run: |
+          set -e
+
+          touch gradle.properties
+
+          if grep -q "^android.useAndroidX=" gradle.properties; then
+            sed -i 's/^android.useAndroidX=.*/android.useAndroidX=true/' gradle.properties
+          else
+            echo "android.useAndroidX=true" >> gradle.properties
+          fi
+
+          if grep -q "^android.enableJetifier=" gradle.properties; then
+            sed -i 's/^android.enableJetifier=.*/android.enableJetifier=true/' gradle.properties
+          else
+            echo "android.enableJetifier=true" >> gradle.properties
+          fi
+
+          if grep -q "^org.gradle.configuration-cache=" gradle.properties; then
+            sed -i 's/^org.gradle.configuration-cache=.*/org.gradle.configuration-cache=false/' gradle.properties
+          else
+            echo "org.gradle.configuration-cache=false" >> gradle.properties
+          fi
+
+          echo ""
+          echo "=== gradle.properties ==="
+          cat gradle.properties
+
+
+      # ==========================================
+      # 7. Создать Gradle Wrapper 8.11.1
+      # ==========================================
+      - name: Generate Gradle Wrapper
+        working-directory: project
+        run: |
+          set -e
+
+          gradle wrapper --gradle-version 8.11.1
+
+          chmod +x ./gradlew
+
+          echo "=== Gradle Wrapper ==="
+          ./gradlew --version
+
+
+      # ==========================================
+      # 8. Создать debug.keystore
+      # ==========================================
+      - name: Create debug keystore
+        working-directory: project
+        run: |
+          set -e
+
+          if [ ! -f "debug.keystore" ]; then
+            keytool -genkeypair \
+              -v \
+              -keystore debug.keystore \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          echo "Debug keystore is ready."
+
+
+      # ==========================================
+      # 9. Остановить Gradle daemon
+      # ==========================================
+      - name: Stop Gradle daemon
+        working-directory: project
+        run: |
+          ./gradlew --stop || true
+
+
+      # ==========================================
+      # 10. Очистить проект
+      # ==========================================
+      - name: Clean project
+        working-directory: project
+        run: |
+          set -e
+
+          ./gradlew clean \
+            --no-build-cache \
+            --no-configuration-cache
+
+
+      # ==========================================
+      # 11. Проверить окружение
+      # ==========================================
+      - name: Check build environment
+        working-directory: project
+        run: |
+          echo "=== Java ==="
+          java -version
+
+          echo ""
+          echo "=== Gradle ==="
+          ./gradlew --version
+
+          echo ""
+          echo "=== AndroidX ==="
+          grep "^android.useAndroidX=" gradle.properties || true
+
+          echo ""
+          echo "=== Jetifier ==="
+          grep "^android.enableJetifier=" gradle.properties || true
+
+          echo ""
+          echo "=== Configuration Cache ==="
+          grep "^org.gradle.configuration-cache=" gradle.properties || true
+
+          echo ""
+          echo "=== Version Catalog ==="
+
+          if [ -f "gradle/libs.versions.toml" ]; then
+            grep -E \
+              'agp =|kotlin =|compose|ksp|room' \
+              gradle/libs.versions.toml || true
+          fi
+
+
+      # ==========================================
+      # 12. Сборка APK
+      # ==========================================
+      - name: Build Debug APK
+        working-directory: project
+        run: |
+          set -e
+
+          ./gradlew assembleDebug \
+            --no-build-cache \
+            --no-configuration-cache \
+            --stacktrace \
+            --warning-mode all
+
+
+      # ==========================================
+      # 13. Найти APK
+      # ==========================================
+      - name: Find APK
+        working-directory: project
+        run: |
+          echo "=== APK files ==="
+
+          find . \
+            -type f \
+            -name "*.apk" \
+            -print
+
+
+      # ==========================================
+      # 14. Загрузить APK
+      # ==========================================
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NextEmu-debug
+          path: project/**/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
